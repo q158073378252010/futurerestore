@@ -6,6 +6,10 @@
 //  Copyright © 2016 tihmstar. All rights reserved.
 //
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <iostream>
 #include <getopt.h>
 #include <string.h>
@@ -14,8 +18,15 @@
 #include "futurerestore.hpp"
 #include "all_tsschecker.h"
 #include "tsschecker.h"
-
-#include "config.h"
+#ifdef HAVE_LIBIPATCHER
+#include <libipatcher/libipatcher.hpp>
+#endif
+#ifdef WIN32
+#include <windows.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#endif
 
 #define safeFree(buf) if (buf) free(buf), buf = NULL
 #define safePlistFree(buf) if (buf) plist_free(buf), buf = NULL
@@ -26,12 +37,18 @@ static struct option longopts[] = {
     { "baseband-manifest",  required_argument,      NULL, 'p' },
     { "sep",                required_argument,      NULL, 's' },
     { "sep-manifest",       required_argument,      NULL, 'm' },
+    { "source-ipsw",        required_argument,      NULL, 'i' },
     { "wait",               no_argument,            NULL, 'w' },
     { "update",             no_argument,            NULL, 'u' },
     { "debug",              no_argument,            NULL, 'd' },
     { "latest-sep",         no_argument,            NULL, '0' },
     { "latest-baseband",    no_argument,            NULL, '1' },
-    { "no-baseband",    no_argument,            NULL, '2' },
+    { "no-baseband",        no_argument,            NULL, '2' },
+    { "exit-recovery",      no_argument,            NULL, '5' },
+#ifdef HAVE_LIBIPATCHER
+    { "use-pwndfu",         no_argument,            NULL, '3' },
+    { "just-boot",          optional_argument,      NULL, '4' },
+#endif
     { NULL, 0, NULL, 0 }
 };
 
@@ -40,56 +57,82 @@ static struct option longopts[] = {
 #define FLAG_LATEST_SEP         1 << 2
 #define FLAG_LATEST_BASEBAND    1 << 3
 #define FLAG_NO_BASEBAND        1 << 4
+#define FLAG_IS_PWN_DFU         1 << 5
 
 void cmd_help(){
-    printf("Usage: futurerestore [OPTIONS] IPSW\n");
-    printf("Allows restoring nonmatching iOS/Sep/Baseband\n\n");
-    
-    printf("  -t, --apticket PATH\t\tApticket used for restoring\n");
+    printf("Usage: futurerestore [OPTIONS] /path/to/ipsw\n\n");
+    printf("Options:\n\n");
+
+    printf("  -t, --apticket PATH\t\tAPTicket used for restoring\n");
+    printf("  -u, --update\t\t\tUpdate instead of erase install (requires appropriate APTicket)\n");
+    printf("  -w, --wait\t\t\tKeep rebooting until nonce matches APTicket (nonce collision, unreliable)\n");
+    printf("  -d, --debug\t\t\tVerbose debug output (useful for error logs)\n");
+    printf("      --latest-sep\t\tUse latest signed sep instead of manually specifying one (may cause bad restore)\n");
+    printf("      --latest-baseband\t\tUse latest signed baseband instead of manually specifying one (may cause bad restore)\n");
+    printf("      --no-baseband\t\tSkip checks and don't flash baseband\n");
+    printf("                   \t\tWARNING: only use this for device without a baseband (eg. iPod or some wifi only iPads)\n");
+    printf("      --exit-recovery\t\tExit recovery mode and quit\n");
+#ifdef HAVE_LIBIPATCHER
+    printf("      --use-pwndfu\t\tuse this for restoring devices with odysseus method. Device needs to be in kDFU mode already\n");
+    printf("      --just-boot=\"-v\"\t\tuse this to tethered boot the device from kDFU mode. You can optionally set bootargs\n");
+#endif
+    printf("\nTo extract baseband/SEP automatically from IPSW:\n\n");
+    printf("  -i, --source-ipsw PATH\tSource IPSW to extract baseband/SEP from\n");
+    printf("\nTo manually specify baseband/SEP:\n\n");
     printf("  -b, --baseband PATH\t\tBaseband to be flashed\n");
-    printf("  -p, --baseband-manifest PATH\tBuildmanifest for requesting baseband ticket\n");
-    printf("  -s, --sep PATH\t\tSep to be flashed\n");
-    printf("  -m, --sep-manifest PATH\tBuildmanifest for requesting sep ticket\n");
-    printf("  -w, --wait\t\t\tkeep rebooting until nonce matches APTicket\n");
-    printf("  -u, --update\t\t\tupdate instead of erase install\n");
-    printf("      --latest-sep\t\tuse latest signed sep instead of manually specifying one(may cause bad restore)\n");
-    printf("      --latest-baseband\t\tse latest signed baseband instead of manually specifying one(may cause bad restore)\n");
-    printf("      --no-baseband\t\tskip checks and don't flash baseband.\n");
-    printf("                   \t\tWARNING: only use this for device without baseband (eg iPod or some wifi only iPads)\n");
+    printf("  -p, --baseband-manifest PATH\tBuildManifest for requesting baseband ticket\n");
+    printf("  -s, --sep PATH\t\tSEP to be flashed\n");
+    printf("  -m, --sep-manifest PATH\tBuildManifest for requesting sep ticket\n");
     printf("\n");
+    printf("Homepage: <" PACKAGE_URL ">\n");
 }
 
 using namespace std;
 int main(int argc, const char * argv[]) {
 #define reterror(code,a ...) do {error(a); err = code; goto error;} while (0)
+
+#ifdef WIN32
+    DWORD termFlags;
+    HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleMode(handle, &termFlags))
+        SetConsoleMode(handle, termFlags | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+
     int err=0;
     int res = -1;
     printf("Version: " VERSION_COMMIT_SHA_FUTURERESTORE" - " VERSION_COMMIT_COUNT_FUTURERESTORE"\n");
+#ifdef HAVE_LIBIPATCHER
+    printf("%s\n",libipatcher::version().c_str());
+    printf("Odysseus Support: yes\n");
+#else
+    printf("Odysseus Support: no\n");
+#endif
 
     int optindex = 0;
     int opt = 0;
     long flags = 0;
-    
-    int isSepManifestSigned = 0;
-    int isBasebandSigned = 0;
-    
+    bool exitRecovery = false;
+
     const char *ipsw = NULL;
     const char *basebandPath = NULL;
     const char *basebandManifestPath = NULL;
     const char *sepPath = NULL;
     const char *sepManifestPath = NULL;
-    
+    const char *bootargs = NULL;
+    const char *sourceIpswPath = nullptr;
+
     vector<const char*> apticketPaths;
-    
+
     t_devicevals devVals = {0};
     t_iosVersion versVals = {0};
-    
+
     if (argc == 1){
         cmd_help();
         return -1;
     }
-    
-    while ((opt = getopt_long(argc, (char* const *)argv, "ht:b:p:s:m:wud01", longopts, &optindex)) > 0) {
+
+
+    while ((opt = getopt_long(argc, (char* const *)argv, "t:i:b:p:s:m:wud0123", longopts, &optindex)) > 0) {
         switch (opt) {
             case 't': // long option: "apticket"; can be called as short option
                 apticketPaths.push_back(optarg);
@@ -106,6 +149,9 @@ int main(int argc, const char * argv[]) {
             case 'm': // long option: "sep-manifest"; can be called as short option
                 sepManifestPath = optarg;
                 break;
+            case 'i': // long option: "source-ipsw"; can be called as short option
+                sourceIpswPath = optarg;
+                break;
             case 'w': // long option: "wait"; can be called as short option
                 flags |= FLAG_WAIT;
                 break;
@@ -121,6 +167,18 @@ int main(int argc, const char * argv[]) {
             case '2': // long option: "no-baseband";
                 flags |= FLAG_NO_BASEBAND;
                 break;
+            case '5': // long option: "exit-recovery";
+                exitRecovery = true;
+                break;
+#ifdef HAVE_LIBIPATCHER
+            case '3': // long option: "no-baseband";
+                flags |= FLAG_IS_PWN_DFU;
+                break;
+            case '4': // long option: "just-boot";
+                bootargs = (optarg) ? optarg : "";
+                break;
+            break;
+#endif
             case 'd': // long option: "debug"; can be called as short option
                 idevicerestore_debug = 1;
                 break;
@@ -132,11 +190,13 @@ int main(int argc, const char * argv[]) {
     if (argc-optind == 1) {
         argc -= optind;
         argv += optind;
-        
+
         ipsw = argv[0];
     }else if (argc == optind && flags & FLAG_WAIT) {
         info("User requested to only wait for APNonce to match, but not actually restoring\n");
-    }else{
+    } else if (exitRecovery) {
+        info("Exiting recovery mode\n");
+    } else {
         error("argument parsing failed! agrc=%d optind=%d\n",argc,optind);
         if (idevicerestore_debug){
             for (int i=0; i<argc; i++) {
@@ -146,17 +206,29 @@ int main(int argc, const char * argv[]) {
         return -5;
     }
     
-    futurerestore client;
+    futurerestore client(flags & FLAG_UPDATE, flags & FLAG_IS_PWN_DFU);
     if (!client.init()) reterror(-3,"can't init, no device found\n");
     
     printf("futurerestore init done\n");
+    if (bootargs && !(flags & FLAG_IS_PWN_DFU)) {
+        reterror(-2,"--just-boot required --use-pwndfu\n");
+    }
+    if (exitRecovery) {
+        client.exitRecovery();
+        info("Done\n");
+        return 0;
+    }
     
     try {
         if (apticketPaths.size()) client.loadAPTickets(apticketPaths);
         
-        if (!((apticketPaths.size() && ipsw)
-              && ((basebandPath && basebandManifestPath) || ((flags & FLAG_LATEST_BASEBAND) || (flags & FLAG_NO_BASEBAND)))
-              && ((sepPath && sepManifestPath) || (flags & FLAG_LATEST_SEP)))) {
+        if (!(
+              ((apticketPaths.size() && ipsw)
+               && ((basebandPath && basebandManifestPath) || sourceIpswPath || (flags & FLAG_LATEST_BASEBAND) || (flags & FLAG_NO_BASEBAND))
+               && ((sepPath && sepManifestPath) || sourceIpswPath || (flags & FLAG_LATEST_SEP) || client.is32bit())
+              ) || (ipsw && bootargs && (flags & FLAG_IS_PWN_DFU))
+            )) {
+            
             if (!(flags & FLAG_WAIT) || ipsw){
                 error("missing argument\n");
                 cmd_help();
@@ -168,55 +240,66 @@ int main(int argc, const char * argv[]) {
             }
             goto error;
         }
-        devVals.deviceModel = (char*)client.getDeviceModelNoCopy();
-        devVals.deviceBoard = (char*)client.getDeviceBoardNoCopy();
-        
-        if (flags & FLAG_LATEST_SEP){
-            info("user specified to use latest signed sep\n");
-            client.loadLatestSep();
+        if (bootargs){
+            
         }else{
-            client.loadSep(sepPath);
-            client.setSepManifestPath(sepManifestPath);
-        }
-        
-        versVals.basebandMode = kBasebandModeWithoutBaseband;
-        if (!(isSepManifestSigned = isManifestSignedForDevice(sepManifestPath, &devVals, &versVals))){
-            reterror(-3,"sep firmware isn't signed\n");
-        }
-        
-        if (flags & FLAG_NO_BASEBAND){
-            printf("\nWARNING: user specified not to flash a baseband. This can make the restore fail if the device needs a baseband!\n");
-            printf("if you added this flag by mistake you can press CTRL-C now to cancel\n");
-            int c = 5;
-            printf("continuing restore in ");
-            while (c) {
-                printf("%d ",c--);
-                fflush(stdout);
-                sleep(1);
+            irecv_device_t device = client.loadDeviceInfo();
+            devVals.deviceModel = const_cast<char *>(device->product_type);
+            devVals.deviceBoard = const_cast<char *>(device->hardware_model);
+
+            if (flags & FLAG_LATEST_SEP) {
+                info("user specified to use latest signed sep\n");
+                client.loadLatestSep();
+            } else if (!client.is32bit()) {
+                if (sourceIpswPath != nullptr) {
+                    client.loadSepFromIpsw(sourceIpswPath);
+                } else {
+                    client.loadSep(sepPath, sepManifestPath);
+                }
             }
-            printf("\n");
-        }else{
-            if (flags & FLAG_LATEST_BASEBAND){
-                info("user specified to use latest signed baseband (WARNING, THIS CAN CAUSE A NON-WORKING RESTORE)\n");
-                client.loadLatestBaseband();
-            }else{
-                client.setBasebandPath(basebandPath);
-                client.setBasebandManifestPath(basebandManifestPath);
-                printf("Did set sep+baseband path and firmware\n");
+
+            versVals.basebandMode = kBasebandModeWithoutBaseband;
+            if (!client.is32bit() && !isManifestSignedForDevice(client.sepManifestPath(), &devVals, &versVals)) {
+                reterror(-3,"sep firmware isn't signed\n");
             }
             
-            versVals.basebandMode = kBasebandModeOnlyBaseband;
-            if (!(devVals.bbgcid = client.getBasebandGoldCertIDFromDevice())){
-                printf("[WARNING] using tsschecker's fallback to get BasebandGoldCertID. This might result in invalid baseband signing status information\n");
-            }
-            if (!(isBasebandSigned = isManifestSignedForDevice(basebandManifestPath, &devVals, &versVals))) {
-                reterror(-3,"baseband firmware isn't signed\n");
+            if (flags & FLAG_NO_BASEBAND){
+                printf("\nWARNING: user specified not to flash a baseband. This can make the restore fail if the device needs a baseband!\n");
+                printf("if you added this flag by mistake you can press CTRL-C now to cancel\n");
+                int c = 5;
+                printf("continuing restore in ");
+                while (c) {
+                    printf("%d ",c--);
+                    fflush(stdout);
+                    sleep(1);
+                }
+                printf("\n");
+            }else{
+                if (flags & FLAG_LATEST_BASEBAND) {
+                    info("user specified to use latest signed baseband (WARNING, THIS CAN CAUSE A NON-WORKING RESTORE)\n");
+                    client.loadLatestBaseband();
+                } else if (sourceIpswPath != nullptr) {
+                    client.loadBasebandFromIpsw(sourceIpswPath);
+                } else {
+                    client.setBasebandPath(basebandPath, basebandManifestPath);
+                    printf("Did set sep+baseband path and firmware\n");
+                }
+                
+                versVals.basebandMode = kBasebandModeOnlyBaseband;
+                if (!(devVals.bbgcid = client.getBasebandGoldCertIDFromDevice())) {
+                    printf("[WARNING] Using tsschecker's fallback BasebandGoldCertID. This might result in invalid baseband signing status information\n");
+                }
+                if (!(devVals.bbsnumSize = client.getBBSNumSizeFromDevice())) {
+                    printf("[WARNING] Using tsschecker's fallback BasebandSerialNumber size. This might result in invalid baseband signing status information\n");
+                }
+                if (!isManifestSignedForDevice(client.basebandManifestPath(), &devVals, &versVals)) {
+                    reterror(-3,"baseband firmware isn't signed\n");
+                }
             }
         }
-        
-        
         client.putDeviceIntoRecovery();
         if (flags & FLAG_WAIT){
+            printf("\n[WARNING] -w is ONLY for nonce collision! If you didn't intend this, remove the -w flag.\n\n");
             client.waitForNonce();
         }
     } catch (int error) {
@@ -224,11 +307,14 @@ int main(int argc, const char * argv[]) {
         printf("[Error] Fail code=%d\n",err);
         goto error;
     }
-    
+
     try {
-        res = client.doRestore(ipsw, flags & FLAG_UPDATE);
+        if (bootargs)
+            res = client.doJustBoot(ipsw,bootargs);
+        else
+            res = client.doRestore(ipsw);
     } catch (int error) {
-        if (error == -20) error("maybe you forgot -w ?\n");
+        if (error == -20) error("Set your APNonce before restoring!\n");
         err = error;
     }
     cout << "Done: restoring "<< (!res ? "succeeded" : "failed")<<"." <<endl;
